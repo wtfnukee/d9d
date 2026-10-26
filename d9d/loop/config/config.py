@@ -53,11 +53,14 @@ class PipeliningConfig(BaseModel):
 
     Attributes:
         schedule: The pipeline schedule configuration.
+        offload_activations: Whether to move the saved activations of a microbatch to host memory between its
+            forward and backward passes, where the schedule leaves room for the copies.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     schedule: AnyPipelineScheduleConfig = Field(default_factory=PipelineScheduleGPipeConfig)
+    offload_activations: bool = False
 
 
 class GarbageCollectionConfig(BaseModel):

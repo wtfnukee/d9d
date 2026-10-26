@@ -2,6 +2,7 @@ import dataclasses
 import typing
 from collections.abc import Callable
 
+import torch
 from torch import nn
 
 from ...core.dist_context import REGULAR_DOMAIN, DistributedContext
@@ -12,7 +13,7 @@ from ..infra.schedule.component.program import (
     invert_stage_to_host_rank_topology,
 )
 from ..infra.schedule.component.runtime import OfflinePipelineExecutor, PipelineScheduleExecutor
-from ..infra.stage import PipelineStage
+from ..infra.stage import ActivationOffloader, PipelineStage
 from .config import (
     AnyPipelineScheduleConfig,
     PipelineScheduleInferenceConfig,
@@ -52,6 +53,7 @@ def _build_schedule_distributed(
     dist_context: DistributedContext,
     schedule_config: AnyPipelineScheduleConfig,
     model_provider: Callable[[PipelineStageInfo], nn.Module],
+    offload_activations: bool,
 ) -> tuple[PipelineScheduleInfo, list[nn.Module]]:
     program_builder = PIPELINE_PROGRAM_REGISTRY.program_for(schedule_config)
     mesh = dist_context.mesh_for(REGULAR_DOMAIN)["pp"]
@@ -63,6 +65,9 @@ def _build_schedule_distributed(
     )
     host_to_stage = invert_stage_to_host_rank_topology(stage_to_host)
     this_rank_stages = host_to_stage[mesh.get_local_rank()]
+
+    # One copy stream for all stages of the rank, so the copies run in program order.
+    copy_stream = torch.cuda.Stream() if offload_activations else None
 
     stages = []
     modules = []
@@ -80,7 +85,13 @@ def _build_schedule_distributed(
         model = model_provider(stage_info)
         modules.append(model)
         stage = PipelineStage(
-            info=stage_info, module=model, group=mesh.get_group(), stage_to_host_topology=stage_to_host
+            info=stage_info,
+            module=model,
+            group=mesh.get_group(),
+            stage_to_host_topology=stage_to_host,
+            activation_offloader=(
+                ActivationOffloader(module=model, copy_stream=copy_stream) if copy_stream is not None else None
+            ),
         )
         stages.append(stage)
 
@@ -88,6 +99,7 @@ def _build_schedule_distributed(
         dist_context=dist_context,
         stages=stages,
         program_builder=program_builder,
+        offload_activations=offload_activations,
     )
 
     return PipelineScheduleInfo(
@@ -99,6 +111,7 @@ def build_schedule(
     dist_context: DistributedContext,
     schedule_config: AnyPipelineScheduleConfig,
     model_provider: Callable[[PipelineStageInfo], nn.Module],
+    offload_activations: bool = False,
 ) -> tuple[PipelineScheduleInfo, list[nn.Module]]:
     """Constructs the pipeline schedule and instantiates model stages.
 
@@ -111,6 +124,10 @@ def build_schedule(
         schedule_config: Configuration object determining the schedule strategy.
         model_provider: A factory function that accepts stage info and returns the ``nn.Module``
             for that stage.
+        offload_activations: Whether to offload the saved activations of a microbatch to host memory
+            between its forward and backward passes, where the schedule leaves room. The
+            ``OfflinePipelineExecutor`` runs each backward pass right after its forward pass, so it
+            never offloads.
 
     Returns:
         A tuple of the schedule info and the list of modules created on this rank.
@@ -120,6 +137,7 @@ def build_schedule(
             dist_context=dist_context,
             schedule_config=schedule_config,
             model_provider=model_provider,
+            offload_activations=offload_activations,
         )
     else:
         return _build_schedule_local(schedule_config=schedule_config, model_provider=model_provider)

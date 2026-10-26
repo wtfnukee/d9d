@@ -39,6 +39,7 @@ The atomic instructions for the pipeline virtual machine.
 *   `BackwardFullInputComputeAction`: Runs the backward pass. It computes gradients for the inputs only, or for the inputs and the weights.
 *   `BackwardWeightComputeAction`: Computes the deferred weight gradients (used in Zero Bubble schedules).
 *   `ForwardSendAction` / `ForwardReceiveAction` / `BackwardSendAction` / `BackwardReceiveAction`: Network I/O.
+*   `ActivationOffloadAction` / `ActivationReloadAction` / `ActivationReleaseAction`: Move the saved activations of a microbatch to host memory, back to the device, and drop them after the last backward pass (see [Activation Offloading](#activation-offloading)).
 *   `ComposeAction`: Groups several actions into one. Schedules such as DualPipeV use it to pair a forward action and a backward action for overlap. The executor currently runs the grouped actions in order.
 
 Actions are declarative and immutable.
@@ -59,6 +60,12 @@ Each step, it receives a **pack** (a sequence of ready per-microbatch inputs) an
 2.  Configures the stage buffers for the pack. It sizes the P2P buffers of each microbatch separately, so microbatches can differ in shape. It skips this step when the shapes match the previous step.
 3.  Iterates over the action list of this rank and applies each action.
 4.  Waits for all pending sends to complete.
+
+### Activation Offloading
+
+The `add_activation_offload_ops` pass rewrites a composed program, after `add_communication_ops`. For each microbatch of each stage on a rank, it adds an offload after the forward pass and its send, a reload before the last compute action ahead of the first backward pass, and a release after the last backward pass. It skips a microbatch with fewer than two compute actions between the forward and the first backward pass, and sets `record_activations` on the forward passes it offloads. `PipelineProgramCache` runs the pass once per microbatch count.
+
+At run time, each stage owns an `ActivationOffloader`. `ForwardComputeHandler` runs the module inside `ActivationOffloader.recording()`, a `torch.autograd.graph.saved_tensors_hooks` scope. The pack hook keeps parameters, buffers and their views on the device and records the storages of the other saved tensors, using the local shard of a `DTensor`. Views of one storage share one record, which covers only the bytes they read. The offload copies these byte ranges into slices of one pinned host arena on a copy stream that all stages of the rank share. The reload copies the arena back to one device buffer in a single transfer, and the unpack hook rebuilds each saved tensor as a view into it, wrapping it back into a `DTensor` where needed. See [DEP-0011](https://github.com/d9d-project/d9d/blob/main/deps/0011-dep-pipeline-activation-offload.md).
 
 ### Comparison with PyTorch
 

@@ -11,7 +11,7 @@ from d9d.pipelining.factory import (
     PipelineScheduleZeroBubbleVConfig,
     build_schedule,
 )
-from d9d.pipelining.infra.schedule.component.runtime import OfflinePipelineExecutor
+from d9d.pipelining.infra.schedule.component.runtime import ActivationOffloadAction, OfflinePipelineExecutor
 from d9d.pipelining.infra.stage import PipelineStage
 
 from d9d_test.pipelining.definitions import (
@@ -32,6 +32,23 @@ def _assert_no_live_buffers(stage_object: PipelineStage):
         assert len(stage_object._forward_receiver._live_buffers) == 0
     if stage_object._backward_receiver is not None:
         assert len(stage_object._backward_receiver._live_buffers) == 0
+
+
+def _assert_no_live_activations(stage_object: PipelineStage, offload_activations: bool):
+    if offload_activations:
+        assert stage_object._activation_offloader.num_live_records == 0
+    else:
+        assert stage_object._activation_offloader is None
+
+
+def _assert_offload_placed(schedule, pp_rank: int, n_microbatches: int, offload_activations: bool):
+    program = schedule._programs.program_for(n_microbatches).program_this_rank
+    offloaded = [action for action in program if isinstance(action, ActivationOffloadAction)]
+    if not offload_activations:
+        assert len(offloaded) == 0
+    # The first rank runs the most forward passes before the first backward pass, so it has room.
+    elif pp_rank == 0 and n_microbatches >= 4:
+        assert len(offloaded) > 0
 
 
 def _do_standard_backward(stages: list[PipelineModel], x: torch.Tensor, y: torch.Tensor):
@@ -71,12 +88,14 @@ def _do_standard_backward(stages: list[PipelineModel], x: torch.Tensor, y: torch
 )
 @pytest.mark.parametrize("n_microbatches", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("freeze_w1", [True, False])
+@pytest.mark.parametrize("offload_activations", [False, True])
 def test_e2e(
     dist_ctx_factory,
     schedule_config: AnyPipelineScheduleConfig,
     stages_per_rank: int,
     n_microbatches: int,
     freeze_w1: bool,
+    offload_activations: bool,
 ):
     dist_ctx = dist_ctx_factory(DeviceMeshParameters(pipeline_parallel=8))
     pp_mesh = dist_ctx.mesh_for(REGULAR_DOMAIN)["pp"]
@@ -107,6 +126,7 @@ def test_e2e(
         dist_context=dist_ctx,
         schedule_config=schedule_config,
         model_provider=_model_provider,
+        offload_activations=offload_activations,
     )
 
     not_this_rank_stages = [i for i in range(len(full_stage_modules)) if i not in this_rank_stages]
@@ -137,8 +157,11 @@ def test_e2e(
         assert len(stage_object._backward_comp._cache) == 0
         assert len(stage_object._forward_comp._cache) == 0
         _assert_no_live_buffers(stage_object)
+        _assert_no_live_activations(stage_object, offload_activations)
 
         check_pp_hooks_ran(this_hooks, n_microbatches, override_w1=0 if freeze_w1 else None)
+
+    _assert_offload_placed(schedule_info.schedule, pp_mesh.get_local_rank(), n_microbatches, offload_activations)
 
     for not_this_stage_i in not_this_rank_stages:
         not_this_stage = full_stage_modules[not_this_stage_i]

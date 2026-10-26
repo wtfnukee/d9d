@@ -36,10 +36,12 @@ class ActionWorkType(StrEnum):
     Attributes:
         compute: The action computes (a forward or backward pass).
         communicate: The action communicates over the network (send or receive).
+        offload: The action moves activations between the device and host memory.
     """
 
     compute = "compute"
     communicate = "communicate"
+    offload = "offload"
 
 
 class ActionBase(abc.ABC):
@@ -69,6 +71,11 @@ class ActionBase(abc.ABC):
     def has_backward_work(self) -> bool:
         """Whether this action is part of the backward pass."""
         ...
+
+    @property
+    def sub_actions(self) -> tuple["ActionBase", ...]:
+        """The actions this action runs: itself, or the grouped actions of a ``ComposeAction``."""
+        return (self,)
 
     @abc.abstractmethod
     def __str__(self) -> str:
@@ -191,10 +198,13 @@ class ForwardComputeAction(ActionBase):
     Attributes:
         stage_idx: The index of the pipeline stage.
         microbatch_idx: The index of the microbatch.
+        record_activations: Whether the forward pass records its saved activations, because the program
+            offloads them.
     """
 
     stage_idx: int
     microbatch_idx: int
+    record_activations: bool = False
 
     def apply(self, ctx: ActionContext[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
         stage = ctx.stages[self.stage_idx]
@@ -206,6 +216,7 @@ class ForwardComputeAction(ActionBase):
             microbatch_index=self.microbatch_idx,
             pipeline_inputs=ctx.pipeline_inputs_microbatches[self.microbatch_idx],
             pipeline_shared=ctx.pipeline_shared_microbatches[self.microbatch_idx],
+            record_activations=self.record_activations,
         )
 
         if stage.info.is_current_stage_last:
@@ -304,6 +315,87 @@ class BackwardWeightComputeAction(ActionBase):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class ActivationOffloadAction(ActionBase):
+    """Action that starts moving the saved activations of a microbatch to host memory.
+
+    Attributes:
+        stage_idx: The index of the pipeline stage.
+        microbatch_idx: The index of the microbatch.
+    """
+
+    stage_idx: int
+    microbatch_idx: int
+
+    def apply(self, ctx: ActionContext[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
+        ctx.stages[self.stage_idx].activation_offloader.offload(self.microbatch_idx)
+
+    @property
+    def work_type(self) -> ActionWorkType:
+        return ActionWorkType.offload
+
+    @property
+    def has_backward_work(self) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return f"{self.stage_idx}OFFLOAD{self.microbatch_idx}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ActivationReloadAction(ActionBase):
+    """Action that starts moving the offloaded activations of a microbatch back to the device.
+
+    Attributes:
+        stage_idx: The index of the pipeline stage.
+        microbatch_idx: The index of the microbatch.
+    """
+
+    stage_idx: int
+    microbatch_idx: int
+
+    def apply(self, ctx: ActionContext[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
+        ctx.stages[self.stage_idx].activation_offloader.reload(self.microbatch_idx)
+
+    @property
+    def work_type(self) -> ActionWorkType:
+        return ActionWorkType.offload
+
+    @property
+    def has_backward_work(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return f"{self.stage_idx}RELOAD{self.microbatch_idx}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ActivationReleaseAction(ActionBase):
+    """Action that drops the activations of a microbatch after its last backward pass.
+
+    Attributes:
+        stage_idx: The index of the pipeline stage.
+        microbatch_idx: The index of the microbatch.
+    """
+
+    stage_idx: int
+    microbatch_idx: int
+
+    def apply(self, ctx: ActionContext[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
+        ctx.stages[self.stage_idx].activation_offloader.release(self.microbatch_idx)
+
+    @property
+    def work_type(self) -> ActionWorkType:
+        return ActionWorkType.offload
+
+    @property
+    def has_backward_work(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return f"{self.stage_idx}RELEASE{self.microbatch_idx}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class ComposeAction(ActionBase):
     """Composite action that runs several sub-actions in order.
 
@@ -318,6 +410,10 @@ class ComposeAction(ActionBase):
     def apply(self, ctx: ActionContext[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
         for act in self.actions:
             act.apply(ctx)
+
+    @property
+    def sub_actions(self) -> tuple[ActionBase, ...]:
+        return self.actions
 
     @property
     def work_type(self) -> ActionWorkType:

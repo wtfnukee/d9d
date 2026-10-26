@@ -270,6 +270,7 @@ class ModelStageFactory:
             dist_context=self._dist_context,
             schedule_config=self._config_pipelining.schedule,
             model_provider=self._build_model_stage,
+            offload_activations=self._config_pipelining.offload_activations,
         )
 
         return schedule, TrackedModules(self._dist_context, modules, stateful_predicate)

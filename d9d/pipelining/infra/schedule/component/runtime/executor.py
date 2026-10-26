@@ -73,6 +73,7 @@ class PipelineScheduleExecutor(PipelineSchedule[Any, Any, Any]):
         dist_context: DistributedContext,
         stages: list[PipelineStage],
         program_builder: "PipelineProgramBuilder",
+        offload_activations: bool = False,
     ):
         """Constructs the ``PipelineScheduleExecutor`` object.
 
@@ -80,10 +81,23 @@ class PipelineScheduleExecutor(PipelineSchedule[Any, Any, Any]):
             dist_context: The distributed context.
             stages: List of stages managed by this executor.
             program_builder: Builder that composes the per-rank action program for a microbatch count.
+            offload_activations: Whether to offload the saved activations to host memory where the program
+                leaves room. Every stage must then have an activation offloader.
+
+        Raises:
+            ValueError: If ``offload_activations`` is set and a stage has no activation offloader.
         """
+        if offload_activations:
+            missing = sorted(stage.info.current_stage for stage in stages if not stage.has_activation_offloader)
+            if missing:
+                raise ValueError(
+                    f"offload_activations is set, but the stages ({missing}) have no activation offloader. "
+                    "Pass activation_offloader to their PipelineStage."
+                )
+
         self._dist_ctx = dist_context
         self._stages = {stage.info.current_stage: stage for stage in stages}
-        self._programs = PipelineProgramCache(dist_context, program_builder)
+        self._programs = PipelineProgramCache(dist_context, program_builder, offload_activations=offload_activations)
         self._comm_handler = PipelineCommunicationHandler(self._stages)
 
         self._buffer_config: _BufferConfig | None = None

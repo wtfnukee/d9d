@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 from d9d.core.dist_context import REGULAR_DOMAIN, DistributedContext
 
+from ..program.offloading import add_activation_offload_ops
 from .action import ActionBase
 
 if TYPE_CHECKING:
@@ -29,17 +30,19 @@ class PipelineProgramCache:
     composed once and reused across steps.
     """
 
-    def __init__(self, dist_context: DistributedContext, builder: "PipelineProgramBuilder"):
+    def __init__(self, dist_context: DistributedContext, builder: "PipelineProgramBuilder", offload_activations: bool):
         """Constructs the ``PipelineProgramCache`` object.
 
         Args:
             dist_context: The distributed context, used to find the position of this rank in the ``pp`` group.
             builder: Builder that composes the all-rank action program for a microbatch count.
+            offload_activations: Whether to add activation offloading to the composed programs.
         """
         pp_group = dist_context.mesh_for(REGULAR_DOMAIN).get_group("pp")
         self._pp_size = pp_group.size()
         self._pp_rank = pp_group.rank()
         self._builder = builder
+        self._offload_activations = offload_activations
         self._cache: dict[int, CachedPipelineProgram] = {}
 
     def program_for(self, num_microbatches: int) -> CachedPipelineProgram:
@@ -54,6 +57,8 @@ class PipelineProgramCache:
         cache_value = self._cache.get(num_microbatches)
         if cache_value is None:
             program_all_ranks = self._builder.compose(num_microbatches=num_microbatches, pp_size=self._pp_size)
+            if self._offload_activations:
+                program_all_ranks = add_activation_offload_ops(program_all_ranks)
             has_backward = any(
                 any(action.has_backward_work for action in sub_program) for sub_program in program_all_ranks.values()
             )

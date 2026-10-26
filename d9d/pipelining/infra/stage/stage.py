@@ -23,6 +23,7 @@ from .computations import (
     BackwardSeedTransfer,
     ForwardComputeHandler,
 )
+from .offload import ActivationOffloader
 
 
 class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput]):
@@ -39,6 +40,7 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
         module: nn.Module,
         group: dist.ProcessGroup,
         stage_to_host_topology: dict[int, int],
+        activation_offloader: ActivationOffloader | None = None,
     ):
         """Constructs the ``PipelineStage`` object.
 
@@ -47,6 +49,8 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
             module: The module that runs this stage.
             group: The pipeline-parallel process group.
             stage_to_host_topology: Mapping from stage index to the pipeline-parallel rank that hosts it.
+            activation_offloader: The offloader that moves the saved activations of this stage to host memory,
+                or ``None`` if the stage keeps them on the device.
 
         Raises:
             TypeError: If the pipeline has more than one stage and the module does not implement
@@ -70,8 +74,9 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
         self._backward_receiver: StageReceiver[TStageTransfer] | None = None
         self._backward_sender: StageSender[TStageTransfer] | None = None
 
+        self._activation_offloader = activation_offloader
         self._forward_comp: ForwardComputeHandler[TPipelineInput, TStageTransfer, TSharedInput, TPipelineOutput] = (
-            ForwardComputeHandler(stage_index=info.current_stage, module=module)
+            ForwardComputeHandler(stage_index=info.current_stage, module=module, offloader=activation_offloader)
         )
         self._backward_comp: BackwardComputeHandler[TPipelineInput, TStageTransfer] | None = None
 
@@ -322,6 +327,7 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
         microbatch_index: int,
         pipeline_inputs: TPipelineInput,
         pipeline_shared: TSharedInput,
+        record_activations: bool = False,
     ):
         """Runs the forward pass for one microbatch.
 
@@ -332,9 +338,12 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
             microbatch_index: The microbatch index.
             pipeline_inputs: The ``PipelineInput`` of the microbatch. Only the first stage uses it.
             pipeline_shared: The ``SharedInput`` passed to every stage.
+            record_activations: Whether to record the saved activations, so that the activation offloader
+                can move them to host memory.
 
         Raises:
-            ValueError: If the stage is not configured.
+            ValueError: If the stage is not configured, or if ``record_activations`` is set and the stage
+                has no activation offloader.
         """
         self._require_configured()
 
@@ -343,7 +352,12 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
         else:
             inputs = self._forward_receiver.pop_inputs(microbatch_index)
 
-        self._forward_comp.run(microbatch_index=microbatch_index, inputs=inputs, shared=pipeline_shared)
+        self._forward_comp.run(
+            microbatch_index=microbatch_index,
+            inputs=inputs,
+            shared=pipeline_shared,
+            record_activations=record_activations,
+        )
 
     def backward_one_chunk(self, microbatch_index: int, loss: torch.Tensor | None = None, full_backward: bool = True):
         """Runs the backward pass for one microbatch.
@@ -404,9 +418,27 @@ class PipelineStage(Generic[TPipelineInput, TStageTransfer, TSharedInput, TPipel
 
         backward_comp.backward_weight(microbatch_index=microbatch_index)
 
+    @property
+    def has_activation_offloader(self) -> bool:
+        """Whether this stage can offload its saved activations."""
+        return self._activation_offloader is not None
+
+    @property
+    def activation_offloader(self) -> ActivationOffloader:
+        """The offloader that moves the saved activations of this stage to host memory.
+
+        Raises:
+            ValueError: If the stage has no activation offloader.
+        """
+        if self._activation_offloader is None:
+            raise ValueError(f"Stage ({self._info.current_stage}) has no activation offloader.")
+        return self._activation_offloader
+
     def reset(self):
-        """Releases the live receive buffers of this stage."""
+        """Releases the live receive buffers and the recorded activations of this stage."""
         if self._forward_receiver is not None:
             self._forward_receiver.reset()
         if self._backward_receiver is not None:
             self._backward_receiver.reset()
+        if self._activation_offloader is not None:
+            self._activation_offloader.reset()

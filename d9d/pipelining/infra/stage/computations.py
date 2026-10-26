@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 from collections.abc import Iterator
 from typing import Generic, cast
@@ -9,6 +10,7 @@ from torch.autograd.graph import Node
 from d9d.core import pytree
 from d9d.pipelining.api import TPipelineInput, TPipelineOutput, TSharedInput, TStageTransfer
 
+from .offload import ActivationOffloader
 from .splitgrad import (
     ParamGroup,
     stage_backward_full,
@@ -40,35 +42,57 @@ class ForwardComputeHandler(Generic[TPipelineInput, TStageTransfer, TSharedInput
     It caches the inputs and outputs of each microbatch for the backward pass.
     """
 
-    def __init__(self, stage_index: int, module: nn.Module):
+    def __init__(self, stage_index: int, module: nn.Module, offloader: ActivationOffloader | None):
         """Constructs the ``ForwardComputeHandler`` object.
 
         Args:
             stage_index: Logical index of the stage.
             module: The module that runs this stage.
+            offloader: The offloader that records the saved activations, or ``None`` if the stage never
+                offloads them.
         """
         self._stage_idx = stage_index
         self._module = module
+        self._offloader = offloader
 
         self._cache: dict[int, ForwardCache[TPipelineInput, TStageTransfer, TPipelineOutput]] = {}
 
-    def run(self, microbatch_index: int, inputs: TPipelineInput | TStageTransfer, shared: TSharedInput):
+    def run(
+        self,
+        microbatch_index: int,
+        inputs: TPipelineInput | TStageTransfer,
+        shared: TSharedInput,
+        record_activations: bool,
+    ):
         """Executes the module's forward pass.
 
         Args:
             microbatch_index: Identifier for the current microbatch.
             inputs: The stage's ``PipelineInput`` (first stage) or incoming ``StageTransfer``.
             shared: The ``SharedInput`` passed to every stage.
+            record_activations: Whether to record the saved activations, so the program can offload them.
 
         Raises:
+            ValueError: If ``record_activations`` is set and the stage has no offloader.
             RuntimeError: If the module forward pass raises. The original exception is chained.
         """
+        offloader = self._offloader if record_activations else None
+        if record_activations and offloader is None:
+            raise ValueError(f"Stage ({self._stage_idx}) has no activation offloader, but the program offloads.")
+
+        recording = offloader.recording(microbatch_index) if offloader is not None else contextlib.nullcontext()
         try:
-            output = self._module(inputs, shared)
+            with recording:
+                output = self._module(inputs, shared)
         except Exception as e:
             raise RuntimeError(
                 f"The forward pass failed on stage ({self._stage_idx}) for microbatch_index ({microbatch_index})."
             ) from e
+
+        if offloader is not None:
+            # The forward cache keeps the inputs and outputs until the backward pass, and the executor keeps the
+            # shared inputs for the whole step, so copying them frees nothing.
+            offloader.keep_resident(microbatch_index, pytree.tree_leaves((inputs, shared, output)))
 
         self._cache[microbatch_index] = ForwardCache(inputs=inputs, outputs=output)
 

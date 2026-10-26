@@ -2,6 +2,9 @@
 
 from .action import (
     ActionBase,
+    ActivationOffloadAction,
+    ActivationReleaseAction,
+    ActivationReloadAction,
     BackwardFullInputComputeAction,
     BackwardReceiveAction,
     BackwardSendAction,
@@ -16,6 +19,9 @@ from .offline import OfflinePipelineExecutor
 
 __all__ = [
     "ActionBase",
+    "ActivationOffloadAction",
+    "ActivationReleaseAction",
+    "ActivationReloadAction",
     "BackwardFullInputComputeAction",
     "BackwardReceiveAction",
     "BackwardSendAction",

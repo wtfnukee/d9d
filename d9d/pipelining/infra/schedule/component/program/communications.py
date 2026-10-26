@@ -6,17 +6,10 @@ from ..runtime.action import (
     BackwardFullInputComputeAction,
     BackwardReceiveAction,
     BackwardSendAction,
-    ComposeAction,
     ForwardComputeAction,
     ForwardReceiveAction,
     ForwardSendAction,
 )
-
-
-def _get_sub_actions(action: ActionBase) -> tuple[ActionBase, ...]:
-    if isinstance(action, ComposeAction):
-        return action.actions
-    return (action,)
 
 
 def _check_action_communication_dependencies_fulfilled(
@@ -64,8 +57,7 @@ def check_action_communication_dependencies_fulfilled(
         ``True`` if all dependencies are met, ``False`` otherwise.
     """
     return all(
-        _check_action_communication_dependencies_fulfilled(sub, rank_events, num_stages)
-        for sub in _get_sub_actions(action)
+        _check_action_communication_dependencies_fulfilled(sub, rank_events, num_stages) for sub in action.sub_actions
     )
 
 
@@ -148,7 +140,7 @@ def add_communication_ops(
                 continue
 
             current_action = compute_actions[rank][0]
-            sub_actions = _get_sub_actions(current_action)
+            sub_actions = current_action.sub_actions
 
             if not check_action_communication_dependencies_fulfilled(
                 current_action, completed_events[rank], num_stages

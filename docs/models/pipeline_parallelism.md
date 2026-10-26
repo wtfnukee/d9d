@@ -163,6 +163,29 @@ Pipelining consumes a **pack**: a sequence of ready microbatches for one step. T
 
 The schedule composes its program once per microbatch count and reuses it. It reallocates buffers when a microbatch shape differs from the previous step.
 
+## Activation Offloading
+
+A rank runs several forward passes before the matching backward passes arrive, so the activations of these microbatches wait in GPU memory. The first ranks wait longest. With `offload_activations`, a stage copies the activations that autograd saves in the forward pass to pinned host memory, and copies them back shortly before the backward pass. This follows the [GLM-5 technical report](https://arxiv.org/abs/2602.15763) and [PipeOffload](https://arxiv.org/abs/2503.01328).
+
+The copies run on a separate CUDA stream and overlap with the forward and backward passes of other microbatches. A microbatch is offloaded only if at least two compute actions of its rank lie between its forward and backward passes: one hides the copy to the host and one hides the copy back. Parameters, buffers and the inputs, shared inputs and outputs of the stage stay on the device. Activation checkpointing works with it: the inputs of checkpointed layers are offloaded too.
+
+Saved `DTensor` activations are offloaded through their local shards. Each offloaded microbatch takes pinned host memory of the size of its activations.
+
+### Performance on 8x A100-SXM4-40GB, bf16
+
+A Llama-7B-shaped model with 32 layers, sequence length 4096 and 16 microbatches per step, split over 8 pipeline ranks:
+
+| Schedule | Checkpointing | Offloading | Step time | Peak memory, busiest rank |
+|:--|:--|:--|--:|--:|
+| 1F1B | on | off | 2950 ms | 6.35 GiB |
+| 1F1B | on | on | 2940-2959 ms | 5.32 GiB |
+| 1F1B | off | on | 14.7-22.2 s | 9.40 GiB |
+| 1F1B | off | off | out of memory | - |
+
+With checkpointing, offloading moves 1.5 GiB per rank and step, hides the copies behind compute and lowers peak memory by 16%. Without checkpointing, each rank moves 37 GiB per step in each direction, which the PCIe links of these GPUs cannot hide. Turn offloading on together with checkpointing, and measure the step time on hosts where pipeline P2P or expert-parallel traffic also crosses PCIe. See [DEP-0011](https://github.com/d9d-project/d9d/blob/main/deps/0011-dep-pipeline-activation-offload.md) for the full measurements.
+
+Jobs without pipeline parallelism run each backward pass right after its forward pass, so the setting changes nothing there.
+
 ## Usage
 
 ### Within the Trainer
@@ -175,6 +198,7 @@ pipelining:
     schedule: 1f1b
     num_stages_per_rank: 2
     zero_bubble: true
+  offload_activations: true  # Optional. See Activation Offloading.
 ```
 
 The `Trainer` builds the schedule and distributes the layers.
